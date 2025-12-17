@@ -2,88 +2,78 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.encoder import ViTEncoder
-from model.decoder import OCRDecoder, Embedder
+from model.ocr import ViT_OCR
+
 from tools.text_to_indices import Tokenizer
-from tools.synt_data import DataGen
+from tools.synt_data import Dataset
 
 from random import randint
+import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
+
+import math
+
+num_steps_per_epoch = 10_000
+
+EPOCHS = 50
+BATCH_SIZE = 32
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 0.05  # рекомендуется для ViT ~0.05
+MAX_GRAD_NORM = 1.0  # для градиентного клиппинга (опционально)
+
+TOTAL_STEPS = EPOCHS * num_steps_per_epoch
+WARMUP_STEPS = 3 * num_steps_per_epoch  # 3 epochs
 
 
-class ViT_OCR(nn.Module):
-    def __init__(self,
-                 vocab_size: int):
-        super(ViT_OCR, self).__init__()
+def add_weight_decay(model, weight_decay=1e-5, skip_list=("bias", "LayerNorm.weight")):
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(nd in name for nd in skip_list):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0}
+    ]
 
-        embed_dim = 512
-
-        self.vocab_size = vocab_size
-
-        self.enc = ViTEncoder(img_size=[1, 3, 224, 224],
-                              kernel_size=8,
-                              embed_dim=embed_dim,
-                              depth=6,
-                              num_head=4,
-                              mlp_ratio=4,
-                              dropout=0.1)
-
-        self.text_embedder = Embedder(vocab_size=vocab_size,
-                                      embed_dim=embed_dim,
-                                      max_seq_len=512,
-                                      padding_idx=0)
-
-        self.dec = OCRDecoder(embed_dim=embed_dim, num_heads=4, hidden_dim=embed_dim*4, dropout=0.1)
-        self.lm_head = nn.Linear(embed_dim, vocab_size).to('cuda')
-
-    def forward(self, x, text):
-        memory = self.enc(x) # (B, num_embed, embed_dim)
-        embed = self.text_embedder(text) # (B num_letters, embed_dim)
-
-        tgt_mask = torch.triu(torch.ones(embed.size(1), embed.size(1)), diagonal=1).bool().to('cuda')
-
-        last_hidden = self.dec(embed, memory, tgt_mask)[:, -1, :] # B, num_letters, embed_dim -> B, embed_dim
-        logits = self.lm_head(last_hidden) # B, vocab_size
-
-        return logits
-
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    return LambdaLR(optimizer, lr_lambda)
 
 
 if __name__ == '__main__':
+
     tokenizer = Tokenizer()
-    model = ViT_OCR(len(tokenizer))
-    dg = DataGen(shape=(224, 224, 3),
-                 num_words=(15, 15),
-                 num_words_in_line=(2, 3)
-                 )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    model = ViT_OCR(tokenizer.vocab_size)
 
-    for k in range(100_000):
+    dataset = Dataset(img_shape=(224, 224, 3),
+                      num_words=(1, 2),
+                      num_words_in_line=(1, 2),
+                      batch_size=BATCH_SIZE,
+                      num_samples=num_steps_per_epoch,
+                      tokenizer=tokenizer)
 
-        x, y = dg.get_data(16) # image, full_text_from_image
+    optimizer_grouped_parameters = add_weight_decay(model, weight_decay=WEIGHT_DECAY)
+    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=LEARNING_RATE)
 
-        x = torch.from_numpy(x).float().to('cuda') # (B, 3, 224, 224)
-        y = tokenizer.tokenize(y) # (B, len_of_max_row)
-        y = torch.from_numpy(y).to('cuda')
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=WARMUP_STEPS,
+        num_training_steps=TOTAL_STEPS
+    )
 
-        i = randint(5, y.shape[1]-5)
-        y_input = y[:, :i] # b, n
-        y_output = y[:, i] # b, 1
-
-        optimizer.zero_grad()
-
-        pred = model(x, y_input)
-
-        loss = F.cross_entropy(
-            pred,
-            y_output,
-            ignore_index=0
-        )
-
-        loss.backward()
-        optimizer.step()
-
-        print(k, loss)
-
-
-torch.save(model.state_dict(), 'backup/vit_ocr.pth')
+    model.to('cuda')
+    model.fit(epochs=EPOCHS,
+              dataset=dataset,
+              optimizer=optimizer,
+              criterion=nn.CrossEntropyLoss(),
+              scheduler=scheduler)
